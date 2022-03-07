@@ -5,6 +5,7 @@ from subprocess import CalledProcessError, TimeoutExpired
 
 import pytest
 
+from mkosi.backend import MkosiException, Verb
 from mkosi.machine import Machine, MkosiMachineTest
 
 pytestmark = [
@@ -26,7 +27,7 @@ class MkosiMachineTestCase(MkosiMachineTest):
 
         # Check = False to see if stderr and returncode have the expected values
         result = self.machine.run(["NonExisting", "Command"], check=False)
-        assert result.returncode in (203, 127)
+        assert result.returncode in (1, 127, 203)
 
         result = self.machine.run(["ls", "-"], check=False)
         assert result.returncode == 2
@@ -38,15 +39,26 @@ class MkosiMachineTestCase(MkosiMachineTest):
 
 
 def test_before_boot() -> None:
-    m = Machine()
+    try:
+        m = Machine()
+    except MkosiException as exception:
+        pytest.skip(str(exception))
+
+    if m.args.verb == Verb.shell:
+        pytest.skip("Shell never boots the machine.")
     with pytest.raises(AssertionError):
         m.run(["ls"])
 
 
 def test_after_shutdown() -> None:
-    with Machine() as m:
-        pass
+    try:
+        with Machine() as m:
+            pass
+    except MkosiException as exception:
+        pytest.skip(str(exception))
 
+    if m.args.verb == Verb.shell:
+        pytest.skip("Shell never boots the machine.")
     with pytest.raises(AssertionError):
         m.run(["ls"])
 
