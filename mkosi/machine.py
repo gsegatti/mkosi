@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import os
 import signal
 import subprocess
 import unittest
+from argparse import Namespace
 from textwrap import dedent
-from typing import Any, Optional, Sequence
+from typing import Any, Iterator, Optional, Sequence
 
 import pexpect  # type: ignore
 
@@ -30,7 +32,7 @@ from . import (
     run_shell_cmdline,
     unlink_output,
 )
-from .backend import MkosiArgs, Verb, die
+from .backend import Distribution, MkosiArgs, MkosiNotSupportedException, Verb, die
 
 
 class Machine:
@@ -41,38 +43,72 @@ class Machine:
         self.debug = debug
         self.stack = contextlib.ExitStack()
         self.args: MkosiArgs
+        self.parsed: Namespace
+        self.unified: bool = False
 
-        tmp = parse_args(args)["default"]
+        self.parsed = parse_args(args)["default"]
 
-        # By default, Mkosi makes Verb = build.
-        # But we want to know if a test class passed args without a Verb.
-        # If so, we'd like to assign default values or the environment's variable value.
-        if tmp.verb == Verb.build and Verb.build.name not in args:
+        # By default, we build every valid image by forcing the verb = Verb.build.
+        # But we want to see which Verb the image was meant to use when booting later.
+        # If no verb was passed via the __init__() args, we look for the environment variable.
+        # By default, Mkosi makes the Verb build if nothing is passed, hence the first condition.
+        if self.parsed.verb == Verb.build and Verb.build.name not in args:
             verb = os.getenv("MKOSI_TEST_DEFAULT_VERB")
             # This way, if environment variable is not set, we assign nspawn by default to test classes with no Verb.
             if verb in (Verb.boot.name, None):
-                tmp.verb = Verb.boot
+                self.parsed.verb = Verb.boot
             elif verb == Verb.qemu.name:
-                tmp.verb = Verb.qemu
+                self.parsed.verb = Verb.qemu
             elif verb == Verb.shell.name:
-                tmp.verb = Verb.shell
+                self.parsed.verb = Verb.shell
             else:
                 die("No valid verb was entered.")
 
         # Add the arguments in the machine class itself, rather than typing this for every testing function.
-        tmp.force = 1
-        tmp.autologin = True
-        tmp.ephemeral = True
-        if tmp.verb == Verb.qemu:
-            tmp.bootable = True
-            tmp.qemu_headless = True
-            tmp.hostonly_initrd = True
-            tmp.netdev = True
-            tmp.ssh = True
-        elif tmp.verb not in (Verb.shell, Verb.boot):
+        self.parsed.force = 1
+        self.parsed.autologin = True
+        self.parsed.ephemeral = True
+        if self.parsed.verb == Verb.qemu:
+            self.parsed.hostonly_initrd = True
+            self.parsed.netdev = True
+            self.parsed.ssh = True
+        elif self.parsed.verb not in (Verb.shell, Verb.boot):
             die("No valid verb was entered.")
 
-        self.args = load_args(tmp)
+        # We create a copy of the results of parse_args().
+        # This way, when we get to the stage of booting an image we can know if that's possible.
+        # Since "self.parsed" is changed to make sure the image is built before failing to be booted.
+        # We then need another variable to see if current options are a valid boot or not.
+        self.parsed.bootable = False
+        self.parsed.qemu_headless = False
+
+        # We want to make sure images which are not bootable are still built.
+        # Therefore, we overpass verb and with_unified_kernel_images passed by the user for now.
+        # Otherwise, load_args() raises an exception before the building is done.
+        # Then, when we actually boot the image, the user's verb is brought back.
+        tmp = Verb.qemu
+        if self.parsed.verb == Verb.boot:
+            tmp = Verb.boot
+
+        self.parsed.verb = Verb.build
+        if not self.parsed.with_unified_kernel_images and "uefi" in self.parsed.boot_protocols:
+            if self.parsed.distribution in (Distribution.debian.name, Distribution.ubuntu.name, Distribution.mageia.name, Distribution.opensuse.name):
+                self.parsed.with_unified_kernel_images = True
+                self.unified = True
+
+
+        self.args = load_args(copy.deepcopy(self.parsed))
+
+
+        self.parsed.verb = tmp
+        if self.parsed.verb == Verb.qemu:
+            self.parsed.bootable = True
+            self.parsed.qemu_headless = True
+        if self.unified:
+            self.parsed.with_unified_kernel_images = False
+
+
+        self.args.verb = self.parsed.verb
 
     @property
     def serial(self) -> pexpect.spawn:
@@ -159,6 +195,16 @@ class Machine:
         self.stack.__exit__(*args, **kwargs)
 
 
+@contextlib.contextmanager
+def pytest_skip_not_supported(args: Namespace) -> Iterator[None]:
+    """See if load_args() raises exception about combination of arguments parsed."""
+    try:
+        load_args(copy.deepcopy(args))
+        yield
+    except MkosiNotSupportedException as exception:
+        raise unittest.SkipTest(str(exception))
+
+
 class MkosiMachineTest(unittest.TestCase):
     args: Sequence[str]
     machine: Machine
@@ -189,7 +235,10 @@ class MkosiMachineTest(unittest.TestCase):
         # Necessary for shell otherwise racing conditions to the disk image will happen.
         test_name = self.id().split(".")[3]
         self.machine.args.hostname = test_name.replace("_", "-")
-        self.machine.boot()
+
+        print(self.machine.parsed.bootable)
+        with pytest_skip_not_supported(self.machine.parsed):
+            self.machine.boot()
 
     def tearDown(self) -> None:
         self.machine.kill()
